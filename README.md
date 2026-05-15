@@ -1,4 +1,4 @@
-# Kaptios SNN Visualizer API
+# SNN Playground API
 
 ## Installation
 
