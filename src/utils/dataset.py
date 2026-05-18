@@ -2,12 +2,13 @@ import numpy as np
 import torch
 from src.schemas.simulation import SamplingMethod
 
+
 def generate_spikes_dataset(
-    sampling: SamplingMethod,
+    sampling:  SamplingMethod,
     n_samples: int,
-    t_steps: int,
+    t_steps:   int,
     n_neurons: int,
-    p_spike: float
+    p_spike:   float,
 ) -> torch.Tensor:
     """
     Generate synthetic spike train datasets using different sampling strategies.
@@ -44,28 +45,24 @@ def generate_spikes_dataset(
         - Temporal correlations depend entirely on sampling method.
     """
     if sampling == SamplingMethod.BERNOULLI:
-        dataset = (np.random.rand(n_samples, t_steps, n_neurons) < p_spike).astype(float)
+        data = (np.random.rand(n_samples, t_steps, n_neurons) < p_spike)
 
     elif sampling == SamplingMethod.UNIFORM:
-        dataset = np.random.choice([0, 1], size=(n_samples, t_steps, n_neurons)).astype(float)
+        # p_spike is ignored — each cell is 0 or 1 with equal probability
+        data = np.random.randint(0, 2, size=(n_samples, t_steps, n_neurons))
 
     elif sampling == SamplingMethod.DETERMINISTIC:
-        dataset = np.zeros((n_samples, t_steps, n_neurons))
-        n_spikes = int(p_spike * t_steps)
-
-        for s in range(n_samples):
-            for n in range(n_neurons):
-                spike_times = np.linspace(0, t_steps-1, n_spikes, dtype=int)
-                dataset[s, spike_times, n] = 1
+        # Identical evenly-spaced pattern across all samples and neurons
+        n_spikes    = int(p_spike * t_steps)
+        spike_times = np.round(np.linspace(0, t_steps - 1, n_spikes)).astype(int)
+        data        = np.zeros((n_samples, t_steps, n_neurons), dtype=bool)
+        data[:, spike_times, :] = True     # broadcast: no loops
 
     elif sampling == SamplingMethod.DETERMINISTIC2:
-        dataset = np.zeros((n_samples, t_steps, n_neurons))
         n_spikes = int(p_spike * t_steps)
-
-        for s in range(n_samples):
-            for n in range(n_neurons):
-                spike_times = np.random.choice(t_steps, size=n_spikes, replace=False)
-                dataset[s, spike_times, n] = 1
-
-    dataset = torch.from_numpy(dataset).float()
-    return dataset
+        # Random permutation trick: argsort(uniform noise) → random ordering
+        perm = np.argsort(np.random.rand(n_samples, n_neurons, t_steps), axis=2)
+        # First n_spikes positions in the permutation mark spike times
+        spike_mask = perm < n_spikes                          # [n_samples, n_neurons, t_steps]
+        data       = spike_mask.transpose(0, 2, 1)           # [n_samples, t_steps, n_neurons]
+    return torch.from_numpy(data.astype(np.float32))

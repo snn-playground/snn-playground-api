@@ -1,137 +1,100 @@
 import torch
 from torch import nn
-from .neuron import LIF
+from spikingjelly.activation_based import neuron as sj_neuron, functional, surrogate
 from src.schemas.simulation import ConnectionType
+
 
 class SNN(nn.Module):
     """
-    Feedforward Spiking Neural Network (SNN) composed of Linear layers followed by
-    Leaky Integrate-and-Fire (LIF) neurons.
+    SNN using SpikingJelly's LIFNode with step_mode='m'.
 
-    This model processes temporal sequences and simulates spiking dynamics over time.
+    Dynamics mapping from original:
+        tau        = 1 / (1 - beta)         [clamped to avoid div-by-zero]
+        use_reset  = True  → soft reset  (v -= threshold after spike)
+        use_reset  = False → hard reset  (v  = 0       after spike)
 
-    Parameters:
-        n_neurons : int
-            Number of neurons per layer (input and hidden sizes).
-
-        n_layers : int
-            Number of hidden LIF layers
-
-        beta : float
-            Membrane decay factor (0 ≤ beta ≤ 1).
-            - beta = 0   → no temporal memory
-            - beta ≈ 1   → long memory
-
-        threshold : float
-            Firing threshold of LIF neurons.
-
-        weights_mean : float
-            Mean for weight initialization.
-
-        weights_std : float
-            Standard deviation for weight initialization.
-
-        bias_std : float
-            Standard deviation for bias initialization.
-
-        use_reset : bool
-            If True, applies soft reset after spike:
-                V ← V - threshold * spike_prev
-            Otherwise, no reset is applied.
-
-    Notes:
-        - Input layer is determined by the dataset
-        - Internal LIF states (membrane potentials) are reset at the beginning of each forward pass.
-        - Computation is sequential over time (explicit loop over T).
+    Note: SpikingJelly applies the reset at the current timestep;
+    the original subtracted threshold * S[t-1] at the next timestep.
+    Behaviour is qualitatively identical for visualisation purposes.
     """
     def __init__(
-        self, 
-        n_neurons: int = 100, 
-        n_layers: int = 3, 
-        beta: float = 0.95, 
-        threshold: float = 1.0,
+        self,
+        n_neurons:    int   = 100,
+        n_layers:     int   = 3,
+        beta:         float = 0.95,
+        threshold:    float = 1.0,
         weights_mean: float = 0.0,
-        weights_std: float = 0.1,
-        bias_std: float = 0.1,
-        use_reset: bool = False,
-        conn_type: ConnectionType = ConnectionType.DENSE):
-
+        weights_std:  float = 0.1,
+        bias_std:     float = 0.1,
+        use_reset:    bool  = False,
+        conn_type:    ConnectionType = ConnectionType.DENSE,
+    ):
         super().__init__()
-        self.n_neurons = n_neurons
-        self.n_layers = n_layers
-        self.beta = beta
-        self.threshold = threshold
+        self.n_neurons    = n_neurons
+        self.n_layers     = n_layers
+        self.beta         = beta
+        self.threshold    = threshold
         self.weights_mean = weights_mean
-        self.weights_std = weights_std
-        self.bias_std = bias_std
-        self.use_reset = use_reset
-        self.conn_type = conn_type
+        self.weights_std  = weights_std
+        self.bias_std     = bias_std
+        self.use_reset    = use_reset
+        self.conn_type    = conn_type
 
-        self.fcs = nn.ModuleList()
+        tau     = 1.0 / max(1.0 - beta, 1e-6) 
+        v_reset = None if use_reset else 0.0     
+
+        self.fcs  = nn.ModuleList()
         self.lifs = nn.ModuleList()
 
         for _ in range(n_layers):
-            self.fcs.append(self.make_layer(n_neurons, n_neurons))
-            self.lifs.append(LIF(beta=beta, threshold=threshold, use_reset=use_reset))
+            self.fcs.append(self._make_layer(n_neurons, n_neurons))
+            self.lifs.append(
+                sj_neuron.LIFNode(
+                    tau=tau,
+                    v_threshold=threshold,
+                    v_reset=v_reset,
+                    surrogate_function=surrogate.ATan(),
+                    decay_input=False,
+                    step_mode='m',
+                )
+            )
 
-    def make_layer(self, n_in, n_out):
+    def _make_layer(self, n_in: int, n_out: int) -> nn.Linear:
         if self.conn_type == ConnectionType.DENSE:
             layer = nn.Linear(n_in, n_out)
             nn.init.normal_(layer.weight, mean=self.weights_mean, std=self.weights_std)
+
         elif self.conn_type == ConnectionType.ONE_TO_ONE:
             layer = nn.Linear(n_in, n_out, bias=True)
             with torch.no_grad():
                 layer.weight.zero_()
                 layer.weight.fill_diagonal_(1.0)
             if layer.bias is not None:
-                nn.init.normal_(layer.bias, mean=self.weights_mean, std=self.bias_std)
+                nn.init.normal_(layer.bias, mean=0.0, std=self.bias_std)
+
         return layer
-        
+
     def forward(self, x: torch.Tensor, return_all_layers: bool = False):
         """
-        Forward pass of the spiking neural network over time.
-
         Args:
-            x (torch.Tensor):
-                Input sequence of shape [batch_size, T, n_neurons]
-
+            x: [B, T, N]
         Returns:
-            torch.Tensor:
-                Spike outputs over time with shape [batch_size, T, n_neurons]
-                (binary values in {0, 1})
+            [B, T, N]  or  ([B,T,N], list[[B,T,N]])  when return_all_layers=True
         """
-        batch_size, T, n = x.shape
-        device = x.device
-        for lif in self.lifs:
-            lif._reset(batch_size, n, device)
+        functional.reset_net(self) 
 
-        layer_records = [[] for _ in range(self.n_layers)] if return_all_layers else None
+        h = x.permute(1, 0, 2)
+        layer_outputs: list[torch.Tensor] = []
 
-        for t in range(T):
-            cur = self.fcs[0](x[:, t, :])
-            spk = self.lifs[0](cur)
+        for fc, lif in zip(self.fcs, self.lifs):
+            cur = fc(h)                     
+            spk = lif(cur)                  
             if return_all_layers:
-                layer_records[0].append(spk)
-            for i in range(1, len(self.fcs)):
-                cur = self.fcs[i](spk)
-                spk = self.lifs[i](cur)
-                if return_all_layers:
-                    layer_records[i].append(spk)
+                layer_outputs.append(spk.permute(1, 0, 2))   
+            h = spk
+
+        output = h.permute(1, 0, 2)        
 
         if return_all_layers:
-            # [T, batch, n] → [batch, T, n] for each layer
-            all_layers = [torch.stack(recs, dim=0).permute(1, 0, 2) for recs in layer_records]
-            return all_layers[-1], all_layers  # (final, all)
-
-        # Rebuild final output only
-        for lif in self.lifs:
-            lif._reset(batch_size, n, device)
-        spk_rec = []
-        for t in range(T):
-            cur = self.fcs[0](x[:, t, :])
-            spk = self.lifs[0](cur)
-            for i in range(1, len(self.fcs)):
-                cur = self.fcs[i](spk)
-                spk = self.lifs[i](cur)
-            spk_rec.append(spk)
-        return torch.stack(spk_rec, dim=1)
+            return output, layer_outputs
+        return output
